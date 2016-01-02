@@ -2,7 +2,7 @@
 
 module Notes
 ( recommendNote,
-  recommendNotes
+  recommendNotes,
 ) where
 
 import Data.List
