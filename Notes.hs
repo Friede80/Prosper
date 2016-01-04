@@ -1,9 +1,9 @@
 {-# LANGUAGE OverloadedStrings #-}
 
 module Notes
-( recommendNote,
-  recommendNotes,
-) where
+    ( recommendNote
+    , recommendNotes
+    ) where
 
 import Data.List
 import Data.Ord
