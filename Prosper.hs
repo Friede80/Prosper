@@ -13,6 +13,7 @@ import Data.Maybe
 import System.Environment
 import System.IO (hFlush, stdout)
 import GHC.Generics
+import Data.ByteString.Internal
 import qualified Data.Vector as V
 
 import Notes
@@ -36,7 +37,7 @@ prosperURL :: Text -> String
 prosperURL target = (prosperAddress <> target) ^. unpacked
 
 -- | Retrives the OAuth2 token from the Prosper server.
-oauthToken :: String -> String -> String -> String -> IO Text
+oauthToken :: String -> String -> String -> String -> IO ByteString
 oauthToken clientID clientSecret userID password = do
     let body =
           [ "grant_type" := ("password" :: String)
@@ -45,18 +46,16 @@ oauthToken clientID clientSecret userID password = do
           , "username" := userID
           , "password" := password]
     resp <- post (prosperURL "security/oauth/token") body
-    return (resp ^. responseBody . key "access_token" . _String)
+    return $ utf8 # (resp ^. responseBody . key "access_token" . _String)
 
 -- | Performs a GET request to the provided target using the provided OAuth2 token.
-getTarget :: Options -> String -> Text -> IO (Response Value)
-getTarget opts url token = getWith (opts & auth ?~ oauth2Bearer token') url >>= asJSON 
-    where
-        token' = utf8 # token        
+getTarget :: Options -> String -> ByteString -> IO (Response Value)
+getTarget opts url token = getWith (opts & auth ?~ oauth2Bearer token) url >>= asJSON       
      
-getPaginated :: Text -> (V.Vector Value -> [a]) -> Text -> IO [a]
+getPaginated :: Text -> (V.Vector Value -> [a]) -> ByteString -> IO [a]
 getPaginated target parseFunc token = getPaginated' target parseFunc token 0
         
-getPaginated' :: Text -> (V.Vector Value -> [a]) -> Text -> Int -> IO [a]
+getPaginated' :: Text -> (V.Vector Value -> [a]) -> ByteString -> Int -> IO [a]
 getPaginated' target parseFunc token offset = do
     resp <- getTarget opts (prosperURL target) token
     let result = resp ^. responseBody . key "result" . _Array 
@@ -81,15 +80,15 @@ parseRespForNotesRating resp = resp ^.. traverse
                                       . key "prosper_rating" 
                                       . _String
 
-getNoteRatings :: Text -> IO [Text]
+getNoteRatings :: ByteString -> IO [Text]
 getNoteRatings = getPaginated "notes/" parseRespForNotesRating
 
-getPendingNoteRatings :: Text -> IO [Text]
+getPendingNoteRatings :: ByteString -> IO [Text]
 getPendingNoteRatings token = do
     pendingIDs <- getPaginated "orders/" parseRespForPendingIDs token
     getRatingsOf token pendingIDs
                          
-getRatingsOf :: Text -> [Integer] -> IO [Text]
+getRatingsOf :: ByteString -> [Integer] -> IO [Text]
 getRatingsOf token listingIDs = 
     fmap (^.. _ratings) $ getTarget defaults (prosperURL searchQuery) token
     where
@@ -97,33 +96,32 @@ getRatingsOf token listingIDs =
         toString xs = intercalate  "," $ map show xs
         _ratings = responseBody . key "result" . _Array . traverse . key "prosper_rating" . _String
 
-getAvailableFunds :: Text -> IO Double
+getAvailableFunds :: ByteString -> IO (Maybe Double)
 getAvailableFunds token = do    
     resp <- getTarget defaults (prosperURL "accounts/prosper/") token
-    let (Just x) =  resp ^? responseBody . key "available_cash_balance" . _Double
-    return x
+    return $ resp ^? responseBody . key "available_cash_balance" . _Double
 
-buyNote :: Text -> Text -> IO ()
+buyNote :: ByteString -> Text -> IO (Maybe Integer)
 buyNote token rating = do 
-    noteID <- findNote token rating
-    case noteID of 
-        (Just x) -> do 
-            putStrLn $ "Buying: " ++ (show x)
+    findRes <- findNote token rating
+    case findRes of 
+        (Just noteID) -> do 
+            putStrLn $ "Buying: " ++ (show noteID)
             let opts = 
                   defaults 
                     & header "Accept" .~ ["application/json"] 
                     & header "Content-Type" .~ ["application/json"] 
-                    & auth ?~ oauth2Bearer token'
+                    & auth ?~ oauth2Bearer token
             let body = 
                   encode 
-                    (BidRequests {bid_requests = [Bid {listing_id = x, bid_amount = 25.00}]})
+                    (BidRequests {bid_requests = [Bid {listing_id = noteID, bid_amount = 25.00}]})
             resp <- postWith opts (prosperURL "orders/") body
-            return ()
-        Nothing -> putStrLn $ "No notes found that match rating: " ++ (rating ^. unpacked)
-    where
-        token' = utf8 # token  
+            return (Just noteID)
+        Nothing -> do
+            putStrLn $ "No notes found that match rating: " ++ (rating ^. unpacked) 
+            return Nothing
         
-findNote :: Text -> Text -> IO (Maybe Integer)
+findNote :: ByteString -> Text -> IO (Maybe Integer)
 findNote token rating = do
     resp <- getTarget defaults (prosperURL searchQuery) token
     let proposedNote = V.head $ resp ^. responseBody . key "result" ._Array    
@@ -142,11 +140,17 @@ main = do
     (clientID:clientSecret:userID:password:xs) <- getArgs 
     token <- oauthToken clientID clientSecret userID password
     availableFunds <- getAvailableFunds token
-    if availableFunds > 25 
-        then do
-            notes <- getNoteRatings token
-            pendingNotes <- getPendingNoteRatings token
-            sequence $ map (buyNote token) $ recommendNotes (notes++pendingNotes) [0, 0, 0.20, 0.20, 0.30, 0.25, 0.05] (floor (availableFunds / 25 ))
-            return ()
-        else print "Insufficient funds"
+    case availableFunds of
+        (Just funds) ->
+            if funds > 25
+                then do
+                    let numNotes = floor (funds / 25 )
+                        myDist = [0, 0, 0.20, 0.20, 0.30, 0.25, 0.05]
+                    notes <- getNoteRatings token
+                    pendingNotes <- getPendingNoteRatings token
+                    purchasedNotes <- mapM (buyNote token) $ recommendNotes (notes++pendingNotes) myDist numNotes
+                    print purchasedNotes                
+                else putStrLn "Insufficient funds"
+        Nothing -> putStrLn "Unable to obtain available funds"
+        
         
