@@ -1,7 +1,8 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE GADTs #-}
 
-import Control.Lens
+import Control.Lens hiding (use)
 import Data.Aeson
 import Data.Aeson.Lens
 import Data.Monoid ((<>))
@@ -17,7 +18,20 @@ import Data.ByteString.Internal
 import qualified Data.Vector as V
 
 import Notes
+    
+data URLPair where
+    (:=>) :: String -> String -> URLPair
+instance Show URLPair where
+    show (key :=> val) = key ++ "=" ++ val
+    showList xs = (++) $ intercalate "&" . map show $ xs
 
+data URL = URL
+    { addr :: String
+    , base :: String
+    , query :: [URLPair] }
+use :: URL -> String
+use url = (addr url) ++ (base url) ++ "?" ++ (show . query $ url)
+    
 data BidRequests  = BidRequests {
     bid_requests :: [Bid]
     } deriving (Generic, Show)
@@ -30,11 +44,14 @@ data Bid = Bid {
 instance ToJSON Bid
 
 -- String Constants
-prosperAddress :: Text
+prosperAddress :: String
 prosperAddress = "https://api.prosper.com/v1/"
 
-prosperURL :: Text -> String
-prosperURL target = (prosperAddress <> target) ^. unpacked
+prosperUrl :: String -> String
+prosperUrl base = prosperUrlWith base []
+
+prosperUrlWith :: String -> [URLPair] -> String
+prosperUrlWith base' query' = use $ URL {addr = prosperAddress, base = base', query = query'}
 
 -- | Retrives the OAuth2 token from the Prosper server.
 oauthToken :: String -> String -> String -> String -> IO ByteString
@@ -45,24 +62,24 @@ oauthToken clientID clientSecret userID password = do
           , "client_secret" := clientSecret 
           , "username" := userID
           , "password" := password]
-    resp <- post (prosperURL "security/oauth/token") body
+    resp <- post (prosperUrl "security/oauth/token") body
     return $ utf8 # (resp ^. responseBody . key "access_token" . _String)
 
 -- | Performs a GET request to the provided target using the provided OAuth2 token.
 getTarget :: Options -> String -> ByteString -> IO (Response Value)
 getTarget opts url token = getWith (opts & auth ?~ oauth2Bearer token) url >>= asJSON       
      
-getPaginated :: Text -> (V.Vector Value -> [a]) -> ByteString -> IO [a]
+getPaginated :: String -> (V.Vector Value -> [a]) -> ByteString -> IO [a]
 getPaginated target parseFunc token = getPaginated' target parseFunc token 0
         
-getPaginated' :: Text -> (V.Vector Value -> [a]) -> ByteString -> Int -> IO [a]
-getPaginated' target parseFunc token offset = do
-    resp <- getTarget opts (prosperURL target) token
+getPaginated' :: String -> (V.Vector Value -> [a]) -> ByteString -> Int -> IO [a]
+getPaginated' url parseFunc token offset = do
+    resp <- getTarget opts url token
     let result = resp ^. responseBody . key "result" . _Array 
     let vals = parseFunc result
     remainder <- if length result /= 25 
                     then return [] 
-                    else getPaginated' target parseFunc token (offset + 25)
+                    else getPaginated' url parseFunc token (offset + 25)
     return (vals ++ remainder)
     where
         opts = defaults & param "offset" .~ [offset ^. re _Show . packed]
@@ -81,24 +98,24 @@ parseRespForNotesRating resp = resp ^.. traverse
                                       . _String
 
 getNoteRatings :: ByteString -> IO [Text]
-getNoteRatings = getPaginated "notes/" parseRespForNotesRating
+getNoteRatings = getPaginated (prosperUrl "notes/") parseRespForNotesRating
 
 getPendingNoteRatings :: ByteString -> IO [Text]
 getPendingNoteRatings token = do
-    pendingIDs <- getPaginated "orders/" parseRespForPendingIDs token
+    pendingIDs <- getPaginated (prosperUrl "orders/") parseRespForPendingIDs token
     getRatingsOf token pendingIDs
                          
 getRatingsOf :: ByteString -> [Integer] -> IO [Text]
 getRatingsOf token listingIDs = 
-    fmap (^.. _ratings) $ getTarget defaults (prosperURL searchQuery) token
+    fmap (^.. _ratings) $ getTarget defaults (prosperUrlWith "search/listings/" query) token
     where
-        searchQuery = ("search/listings/?listing_number=" ++ toString listingIDs) ^. packed
+        query = [ "listing_number" :=> (toString listingIDs)]
         toString xs = intercalate  "," $ map show xs
         _ratings = responseBody . key "result" . _Array . traverse . key "prosper_rating" . _String
 
 getAvailableFunds :: ByteString -> IO (Maybe Double)
 getAvailableFunds token = do    
-    resp <- getTarget defaults (prosperURL "accounts/prosper/") token
+    resp <- getTarget defaults (prosperUrl "accounts/prosper/") token
     return $ resp ^? responseBody . key "available_cash_balance" . _Double
 
 buyNote :: ByteString -> Text -> IO (Maybe Integer)
@@ -115,7 +132,7 @@ buyNote token rating = do
             let body = 
                   encode 
                     (BidRequests {bid_requests = [Bid {listing_id = noteID, bid_amount = 25.00}]})
-            resp <- postWith opts (prosperURL "orders/") body
+            resp <- postWith opts (prosperUrl "orders/") body
             return (Just noteID)
         Nothing -> do
             putStrLn $ "No notes found that match rating: " ++ (rating ^. unpacked) 
@@ -123,34 +140,38 @@ buyNote token rating = do
         
 findNote :: ByteString -> Text -> IO (Maybe Integer)
 findNote token rating = do
-    resp <- getTarget defaults (prosperURL searchQuery) token
+    resp <- getTarget defaults (prosperUrlWith "search/listings/" query) token
     let proposedNote = V.head $ resp ^. responseBody . key "result" ._Array    
     return $ listingID proposedNote
     where
-        searchQuery = ("search/listings/?" ++
-                       "sort_by=effective_yield desc&" ++
-                       "listing_term=36&" ++
-                       "listing_title=\"Debt Consolidation\"&" ++
-                       "exclude_listings_invested=true&" ++
-                       "prosper_rating=\"" ++ (rating ^. unpacked) ++ "\"") ^. packed
+        query = [ "sort_by" :=> "effective_yield desc"
+                , "listing_term" :=> "36"
+                , "listing_title" :=> "Debt Consolidation"
+                , "exclude_listings_invested" :=> "true"
+                , "prosper_rating" :=> (rating ^. unpacked) ] 
         listingID x = x ^? key "listing_number" . _Integer
     
-main :: IO ()
-main = do
+mainT :: IO ()
+mainT = do
     (clientID:clientSecret:userID:password:xs) <- getArgs 
     token <- oauthToken clientID clientSecret userID password
     availableFunds <- getAvailableFunds token
     case availableFunds of
         (Just funds) ->
             if funds > 25
-                then do
+                then do                    
+                    currentNotes <- getNoteRatings token
+                    pendingNotes <- getPendingNoteRatings token
                     let numNotes = floor (funds / 25 )
                         myDist = [0, 0, 0.20, 0.20, 0.30, 0.25, 0.05]
-                    notes <- getNoteRatings token
-                    pendingNotes <- getPendingNoteRatings token
-                    purchasedNotes <- mapM (buyNote token) $ recommendNotes (notes++pendingNotes) myDist numNotes
+                        notes = currentNotes ++ pendingNotes
+                    purchasedNotes <- mapM (buyNote token) $ recommendNotes notes myDist numNotes
                     print purchasedNotes                
                 else putStrLn "Insufficient funds"
         Nothing -> putStrLn "Unable to obtain available funds"
-        
-        
+
+main = do
+    (clientID:clientSecret:userID:password:xs) <- getArgs 
+    token <- oauthToken clientID clientSecret userID password
+    findRes <- findNote token "C"
+    print findRes
