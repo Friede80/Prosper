@@ -15,6 +15,7 @@ import System.Environment
 import System.IO (hFlush, stdout)
 import GHC.Generics
 import Data.ByteString.Internal
+import Control.Concurrent.Async (mapConcurrently)
 import qualified Data.Vector as V
 
 import Notes
@@ -70,13 +71,13 @@ getTarget :: Options -> String -> ByteString -> IO (Response Value)
 getTarget opts url token = getWith (opts & auth ?~ oauth2Bearer token) url >>= asJSON       
      
 getPaginated :: String -> (V.Vector Value -> [a]) -> ByteString -> IO [a]
-getPaginated target parseFunc token = getPaginated' target parseFunc token 0
+getPaginated url parseFunc token = getPaginated' url parseFunc token 0
         
 getPaginated' :: String -> (V.Vector Value -> [a]) -> ByteString -> Int -> IO [a]
 getPaginated' url parseFunc token offset = do
     resp <- getTarget opts url token
     let result = resp ^. responseBody . key "result" . _Array 
-    let vals = parseFunc result
+        vals = parseFunc result
     remainder <- if length result /= 25 
                     then return [] 
                     else getPaginated' url parseFunc token (offset + 25)
@@ -97,6 +98,11 @@ parseRespForNotesRating resp = resp ^.. traverse
                                       . key "prosper_rating" 
                                       . _String
 
+parseListings :: V.Vector Value -> [Integer]
+parseListings resp = resp ^.. traverse
+                            . key "listing_number"
+                            . _Integer
+                                      
 getNoteRatings :: ByteString -> IO [Text]
 getNoteRatings = getPaginated (prosperUrl "notes/") parseRespForNotesRating
 
@@ -118,60 +124,49 @@ getAvailableFunds token = do
     resp <- getTarget defaults (prosperUrl "accounts/prosper/") token
     return $ resp ^? responseBody . key "available_cash_balance" . _Double
 
-buyNote :: ByteString -> Text -> IO (Maybe Integer)
-buyNote token rating = do 
-    findRes <- findNote token rating
-    case findRes of 
-        (Just noteID) -> do 
-            putStrLn $ "Buying: " ++ (show noteID)
-            let opts = 
-                  defaults 
-                    & header "Accept" .~ ["application/json"] 
-                    & header "Content-Type" .~ ["application/json"] 
-                    & auth ?~ oauth2Bearer token
-            let body = 
-                  encode 
-                    (BidRequests {bid_requests = [Bid {listing_id = noteID, bid_amount = 25.00}]})
-            resp <- postWith opts (prosperUrl "orders/") body
-            return (Just noteID)
-        Nothing -> do
-            putStrLn $ "No notes found that match rating: " ++ (rating ^. unpacked) 
-            return Nothing
-        
-findNote :: ByteString -> Text -> IO (Maybe Integer)
-findNote token rating = do
-    resp <- getTarget defaults (prosperUrlWith "search/listings/" query) token
-    let proposedNote = V.head $ resp ^. responseBody . key "result" ._Array    
-    return $ listingID proposedNote
-    where
-        query = [ "sort_by" :=> "effective_yield desc"
-                , "listing_term" :=> "36"
-                , "listing_title" :=> "Debt Consolidation"
-                , "exclude_listings_invested" :=> "true"
-                , "prosper_rating" :=> (rating ^. unpacked) ] 
-        listingID x = x ^? key "listing_number" . _Integer
+buyNotes :: ByteString -> [Text] -> IO ([Integer])
+buyNotes token ratings = do 
+    notesToPurchase <- fmap concat . mapM selectNotes . notes $ ratings 
+    let opts = 
+              defaults 
+                & header "Accept" .~ ["application/json"] 
+                & header "Content-Type" .~ ["application/json"] 
+                & auth ?~ oauth2Bearer token
+        body = encode (BidRequests {bid_requests = (bids notesToPurchase)})                
+    resp <- postWith opts (prosperUrl "orders/") body
+    -- TODO: Verify notes were purchased successfully
+    return notesToPurchase
+    where        
+        notes = map (\l@(x:xs) -> (x, length l)) . group . sort    
+        bids = map (\x -> (Bid {listing_id = x, bid_amount = 25.00}))        
+        selectNotes (rating, count) = do
+            let query rating = [ "sort_by" :=> "effective_yield desc"
+                               , "listing_term" :=> "36"
+                               , "listing_title" :=> "Debt Consolidation"
+                               , "exclude_listings_invested" :=> "true"
+                               , "prosper_rating" :=> (rating ^. unpacked) ] 
+            findRes <- findNotes token (query rating)
+            return $ take count findRes 
+                
+                       
+findNotes :: ByteString -> [URLPair] -> IO ([Integer])
+findNotes token query = getPaginated (prosperUrlWith "search/listings/" query) parseListings token
     
-mainT :: IO ()
-mainT = do
+main :: IO ()
+main = do
     (clientID:clientSecret:userID:password:xs) <- getArgs 
     token <- oauthToken clientID clientSecret userID password
     availableFunds <- getAvailableFunds token
     case availableFunds of
         (Just funds) ->
-            if funds > 25
+            if funds >= 25
                 then do                    
                     currentNotes <- getNoteRatings token
                     pendingNotes <- getPendingNoteRatings token
                     let numNotes = floor (funds / 25 )
                         myDist = [0, 0, 0.20, 0.20, 0.30, 0.25, 0.05]
                         notes = currentNotes ++ pendingNotes
-                    purchasedNotes <- mapM (buyNote token) $ recommendNotes notes myDist numNotes
+                    purchasedNotes <- buyNotes token $ recommendNotes notes myDist numNotes
                     print purchasedNotes                
                 else putStrLn "Insufficient funds"
         Nothing -> putStrLn "Unable to obtain available funds"
-
-main = do
-    (clientID:clientSecret:userID:password:xs) <- getArgs 
-    token <- oauthToken clientID clientSecret userID password
-    findRes <- findNote token "C"
-    print findRes
