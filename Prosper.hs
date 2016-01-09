@@ -71,19 +71,23 @@ getTarget :: Options -> String -> ByteString -> IO (Response Value)
 getTarget opts url token = getWith (opts & auth ?~ oauth2Bearer token) url >>= asJSON       
      
 getPaginated :: String -> (V.Vector Value -> [a]) -> ByteString -> IO [a]
-getPaginated url parseFunc token = getPaginated' url parseFunc token 0
-        
-getPaginated' :: String -> (V.Vector Value -> [a]) -> ByteString -> Int -> IO [a]
-getPaginated' url parseFunc token offset = do
-    resp <- getTarget opts url token
-    let result = resp ^. responseBody . key "result" . _Array 
-        vals = parseFunc result
-    remainder <- if length result /= 25 
-                    then return [] 
-                    else getPaginated' url parseFunc token (offset + 25)
-    return (vals ++ remainder)
+getPaginated url parseFunc token = do
+    resp <- getTarget defaults url token
+    let totalResults = resp ^? responseBody . key "total_count" . _Double
+        vals = extractVals resp
+    case totalResults of
+        (Just results) -> do
+            let n = ceiling $ results / 25
+                offsets = take (n-1) [25,50..]
+            restOfVals <- fmap concat $ mapConcurrently someFunc offsets
+            return (vals ++ restOfVals) 
+        Nothing -> return vals
     where
-        opts = defaults & param "offset" .~ [offset ^. re _Show . packed]
+        extractVals response = parseFunc $ response ^. responseBody . key "result" . _Array
+        someFunc offset' = do
+            let opts = defaults & param "offset" .~ [offset' ^. re _Show . packed]
+            resp' <- getTarget opts url token
+            return $ extractVals resp'
         
 parseRespForPendingIDs :: V.Vector Value -> [Integer]
 parseRespForPendingIDs result = catMaybes $ map listingID pendingBids
@@ -170,3 +174,4 @@ main = do
                     print purchasedNotes                
                 else putStrLn "Insufficient funds"
         Nothing -> putStrLn "Unable to obtain available funds"
+        
